@@ -1,60 +1,141 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
 from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime
-import random
+from typing import List
+from datetime import datetime, timedelta
+import os
 
-app = FastAPI(title="PhishGuard SOC API")
+# =====================
+# CONFIG
+# =====================
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_IN_PROD")
+JWT_ALGO = "HS256"
+TOKEN_EXPIRE_MINUTES = 60
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# =====================
+# APP
+# =====================
+app = FastAPI(
+    title="SOC Phishing Platform API",
+    version="1.0.0",
 )
 
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+# =====================
+# MODELS
+# =====================
+class TokenData(BaseModel):
+    sub: str
+    role: str
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class EmailScan(BaseModel):
+    subject: str
+    body: str
+    urls: List[str] = []
+
+# =====================
+# AUTH HELPERS
+# =====================
+def create_token(user_id: str, role: str):
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> TokenData:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return TokenData(**payload)
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+
+def require_role(*allowed_roles):
+    def checker(user: TokenData = Depends(get_current_user)):
+        if user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return user
+    return checker
+
+# =====================
+# HEALTH
+# =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "PhishGuard SOC API"}
+    return {
+        "status": "ok",
+        "service": "SOC Phishing Platform",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+# =====================
+# AUTH
+# =====================
+@app.post("/token", response_model=LoginResponse)
+def login():
+    """
+    Demo token endpoint.
+    Replace with real auth later.
+    """
+    return {
+        "access_token": create_token("user-123", "analyst"),
+    }
 
-@app.get("/soc")
-def get_soc_events():
-    events = []
-    threat_types = ["phishing", "malware", "ransomware", "credential_theft", "social_engineering"]
-    severities = ["critical", "high", "medium", "low"]
-    
-    for i in range(20):
-        events.append({
-            "id": f"EVT-{1000+i}",
-            "timestamp": datetime.now().isoformat(),
-            "threat_type": random.choice(threat_types),
-            "severity": random.choice(severities),
-            "source_ip": f"192.168.{random.randint(1,255)}.{random.randint(1,255)}",
-            "destination": f"user{random.randint(1,100)}@company.com",
-            "status": random.choice(["detected", "blocked", "investigating"]),
-            "description": f"Suspicious activity detected - Event {i+1}"
-        })
-    return {"events": events, "total": len(events)}
+# =====================
+# PROTECTED ROUTES
+# =====================
+@app.post("/scan")
+def scan_email(
+    email: EmailScan,
+    user: TokenData = Depends(require_role("analyst", "admin")),
+):
+    score = 0
+    keywords = ["urgent", "verify", "password", "login"]
+    content = (email.subject + email.body).lower()
+
+    for k in keywords:
+        if k in content:
+            score += 20
+
+    return {
+        "requested_by": user.sub,
+        "role": user.role,
+        "risk_score": min(score, 100),
+        "verdict": "PHISHING" if score >= 60 else "SAFE",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 @app.get("/soc-metrics")
-def get_metrics():
+def soc_metrics(
+    user: TokenData = Depends(require_role("admin")),
+):
     return {
-        "total_threats": random.randint(150, 300),
-        "blocked": random.randint(100, 200),
-        "investigating": random.randint(10, 30),
-        "resolved": random.randint(50, 100),
-        "critical_count": random.randint(5, 15),
-        "high_count": random.randint(20, 40),
-        "medium_count": random.randint(40, 80),
-        "low_count": random.randint(30, 60)
+        "total_threats": 245,
+        "blocked": 180,
+        "investigating": 42,
+        "critical": 23,
+        "requested_by": user.sub,
     }
 
 @app.get("/tenant")
-def get_tenant():
-    return {"tenant_id": "default", "name": "PhishGuard SOC", "status": "active"}
+def tenant_info(
+    user: TokenData = Depends(require_role("admin", "analyst")),
+):
+    return {
+        "tenant_id": "default",
+        "name": "PhishGuard SOC",
+        "status": "active",
+    }
